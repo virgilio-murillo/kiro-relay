@@ -1,3 +1,17 @@
-[kiro-relay] Listening on 0.0.0.0:9200
+[kiro-relay] Listening on 0.0.0.0:9200 (threaded, long-poll enabled)
 [kiro-relay] Data dir: /Users/murivirg/work/sessions/2026-05/W2/2026-05-10/kiro-relay/data
-[FILE] Received: mac_pubkey (183 bytes, md5:a2a59a7266a64022150d7087ecf51d51)
+[QUEUED] setup-systemd-and-longpoll: Two things:
+
+1. UPGRADE YOUR POLLING: The relay now supports long-polling. Inste
+[OUT] Delivered 1 task(s)
+[IN] result: Task setup-systemd-and-longpoll complete.
+
+IMPLEMENTED:
+1. kiro-relay-worker upgraded to long-poll (
+[QUEUED] setup-systemd-and-longpoll-v2: UPGRADE YOUR POLLING: The relay now supports long-polling. Instead of polling ev
+[OUT] Delivered 1 task(s)
+[IN] ready: Laptop agent fully autonomous. Worker running via systemd. All future instructions should come throu
+[QUEUED] switch-to-foreground: STOP the background kiro-relay-worker process and disable the systemd service if
+[OUT] Delivered 1 task(s)
+[IN] result: Done. Background worker stopped and disabled. Created kiro-relay-wait — foreground long-poll script.
+[IN] result: Already completed in previous iteration. Superseded by switch-to-foreground task.

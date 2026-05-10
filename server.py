@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""kiro-relay: Bidirectional task relay with file transfer support."""
+"""kiro-relay: Bidirectional relay with long-polling."""
 import json
 import os
-import base64
 import hashlib
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +27,12 @@ def save_json(path, data):
 
 INBOX = load_json(INBOX_FILE, [])
 TASKS = load_json(TASKS_FILE, [])
+ACKS = {}
 HEARTBEAT = {"last": None}
+
+# Long-poll events
+inbox_event = threading.Event()
+tasks_event = threading.Event()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,8 +50,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        params = parse_qs(urlparse(self.path).query)
 
         if path == "/tasks":
+            # Long-poll: if no tasks, wait up to timeout seconds
+            timeout = float(params.get("timeout", [0])[0])
+            if not TASKS and timeout > 0:
+                tasks_event.clear()
+                tasks_event.wait(timeout=timeout)
             pending = list(TASKS)
             TASKS.clear()
             save_json(TASKS_FILE, TASKS)
@@ -59,13 +70,22 @@ class Handler(BaseHTTPRequestHandler):
                 "status": "alive",
                 "inbox_count": len(INBOX),
                 "pending_tasks": len(TASKS),
+                "acked_tasks": len(ACKS),
                 "heartbeat": HEARTBEAT["last"],
             })
 
         elif path == "/inbox":
-            params = parse_qs(urlparse(self.path).query)
             last_n = int(params.get("last", [10])[0])
             self._respond(200, {"messages": INBOX[-last_n:]})
+
+        elif path == "/inbox/wait":
+            # Long-poll: block until new inbox message or timeout
+            timeout = float(params.get("timeout", [30])[0])
+            count_before = len(INBOX)
+            inbox_event.clear()
+            inbox_event.wait(timeout=timeout)
+            new_msgs = INBOX[count_before:]
+            self._respond(200, {"new": len(new_msgs) > 0, "messages": new_msgs})
 
         elif path.startswith("/files/"):
             filename = path[7:]
@@ -86,10 +106,10 @@ class Handler(BaseHTTPRequestHandler):
 
         else:
             self._respond(200, {"status": "alive", "endpoints": [
-                "GET /tasks", "GET /status", "GET /inbox?last=N",
-                "GET /files", "GET /files/<name>",
-                "POST /", "POST /heartbeat", "POST /files/<name>",
-                "PUT /tasks",
+                "GET /tasks?timeout=N", "GET /status", "GET /inbox?last=N",
+                "GET /inbox/wait?timeout=N", "GET /files", "GET /files/<name>",
+                "POST /", "POST /heartbeat", "POST /ack/<task_id>",
+                "POST /files/<name>", "PUT /tasks",
             ]})
 
     def do_POST(self):
@@ -99,13 +119,19 @@ class Handler(BaseHTTPRequestHandler):
             HEARTBEAT["last"] = datetime.now().isoformat()
             self._respond(200, {"status": "ok"})
 
+        elif path.startswith("/ack/"):
+            task_id = path[5:]
+            ACKS[task_id] = datetime.now().isoformat()
+            print(f"[ACK] {task_id}", flush=True)
+            self._respond(200, {"status": "acked", "task_id": task_id})
+
         elif path.startswith("/files/"):
             filename = path[7:]
             data = self._read_body()
             filepath = FILES_DIR / filename
             filepath.write_bytes(data)
             md5 = hashlib.md5(data).hexdigest()
-            print(f"[FILE] Received: {filename} ({len(data)} bytes, md5:{md5})", flush=True)
+            print(f"[FILE] {filename} ({len(data)}B)", flush=True)
             self._respond(200, {"status": "stored", "filename": filename, "size": len(data), "md5": md5})
 
         else:
@@ -113,7 +139,8 @@ class Handler(BaseHTTPRequestHandler):
             body["received_at"] = datetime.now().isoformat()
             INBOX.append(body)
             save_json(INBOX_FILE, INBOX)
-            print(f"[IN] {body.get('type','?')}: {body.get('content','')[:150]}", flush=True)
+            print(f"[IN] {body.get('type','?')}: {body.get('content','')[:100]}", flush=True)
+            inbox_event.set()  # Wake up any long-pollers
             self._respond(200, {"status": "ok"})
 
     def do_PUT(self):
@@ -123,7 +150,8 @@ class Handler(BaseHTTPRequestHandler):
             body["queued_at"] = datetime.now().isoformat()
             TASKS.append(body)
             save_json(TASKS_FILE, TASKS)
-            print(f"[QUEUED] {body.get('content','')[:150]}", flush=True)
+            print(f"[QUEUED] {body.get('id', 'no-id')}: {body.get('content','')[:80]}", flush=True)
+            tasks_event.set()  # Wake up laptop long-poll
             self._respond(200, {"status": "queued", "pending": len(TASKS)})
         else:
             self._respond(404, {"error": "not found"})
@@ -132,9 +160,25 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class ThreadedHTTPServer(HTTPServer):
+    """Handle each request in a new thread for long-polling support."""
+    def process_request(self, request, client_address):
+        t = threading.Thread(target=self.process_request_thread, args=(request, client_address))
+        t.daemon = True
+        t.start()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 9200))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"[kiro-relay] Listening on 0.0.0.0:{port}", flush=True)
+    server = ThreadedHTTPServer(("0.0.0.0", port), Handler)
+    print(f"[kiro-relay] Listening on 0.0.0.0:{port} (threaded, long-poll enabled)", flush=True)
     print(f"[kiro-relay] Data dir: {DATA_DIR}", flush=True)
     server.serve_forever()
