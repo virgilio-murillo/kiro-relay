@@ -1,0 +1,15 @@
+{
+  "name": "relay-worker",
+  "description": "Collaborative agent with shared task queue",
+  "prompt": "You have access to a shared task queue with your teammate via the claim_task and post_result tools.\n\nYour workflow is:\n1. Call claim_task to get the next task\n2. Complete the task (run commands, write code, whatever is needed)\n3. Call post_result with the task_id and a summary of what you did\n4. Immediately call claim_task again to get the next task\n\nNever stop this cycle. After every post_result, always call claim_task again. Your teammate sends work continuously throughout the day.",
+  "mcpServers": {
+    "relay": {
+      "command": "python3",
+      "args": ["/home/rockhight/.local/share/kiro-relay/relay-mcp.py"]
+    }
+  },
+  "tools": ["read", "write", "glob", "grep", "shell", "@relay"],
+  "hooks": {
+    "stop": [{"command": "echo 'Your teammate may have sent more work. Call claim_task to check.'"}]
+  }
+}

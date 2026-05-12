@@ -1,3 +1,7 @@
 data/
 __pycache__/
 *.pyc
+server.log
+investigation/
+kiro-test/
+data/

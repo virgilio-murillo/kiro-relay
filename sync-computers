@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""sync-computers — TUI for M2M relay communication between machines."""
+import curses
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+DISCOVERY_PORT = 9199
+RELAY_BASE_PORT = 9200
+BROADCAST_INTERVAL = 2
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HOME = os.path.expanduser("~")
+RELAY_DIR = os.environ.get("KIRO_RELAY_DIR",
+    os.path.join(SCRIPT_DIR) if os.path.exists(os.path.join(SCRIPT_DIR, "server.py"))
+    else os.path.join(HOME, ".local", "share", "kiro-relay"))
+
+peers = {}  # ip -> {hostname, role, port, last_seen}
+my_role = None
+my_hostname = socket.gethostname()
+my_ip = ""
+relay_port = None
+running = True
+
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def broadcast_presence():
+    """Broadcast our presence via UDP."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    while running:
+        msg = json.dumps({
+            "hostname": my_hostname,
+            "ip": my_ip,
+            "role": my_role,
+            "port": relay_port,
+        }).encode()
+        try:
+            sock.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
+        except Exception:
+            pass
+        time.sleep(BROADCAST_INTERVAL)
+    sock.close()
+
+
+def listen_for_peers():
+    """Listen for UDP broadcasts from other machines."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass
+    sock.bind(("", DISCOVERY_PORT))
+    sock.settimeout(1)
+    while running:
+        try:
+            data, addr = sock.recvfrom(1024)
+            peer = json.loads(data.decode())
+            if peer["ip"] != my_ip:
+                peer["last_seen"] = time.time()
+                peers[peer["ip"]] = peer
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
+    sock.close()
+
+
+def find_free_port():
+    for port in range(RELAY_BASE_PORT, RELAY_BASE_PORT + 11):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("0.0.0.0", port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    return None
+
+
+def start_relay_server():
+    global relay_port
+    relay_port = find_free_port()
+    if not relay_port:
+        return False
+    server_py = os.path.join(RELAY_DIR, "server.py")
+    if not os.path.exists(server_py):
+        return False
+    env = os.environ.copy()
+    env["PORT"] = str(relay_port)
+    subprocess.Popen(
+        [sys.executable, server_py],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    time.sleep(2)
+    return True
+
+
+def launch_worker(controller_ip, controller_port):
+    """Launch interactive kiro-cli with relay-worker agent."""
+    global running
+    running = False
+    # Update agent config with correct relay URL
+    agent_path = os.path.join(HOME, ".kiro", "agents", "relay-worker.json")
+    mcp_path = os.path.join(RELAY_DIR, "relay-mcp.py")
+    agent = {
+        "name": "relay-worker",
+        "description": "Collaborative peer agent",
+        "prompt": (
+            "You are a collaborative peer working with a teammate on another machine. "
+            "You communicate via shared tools: claim_task and post_result.\n\n"
+            "Your workflow:\n"
+            "1. Call claim_task to check for messages from your teammate\n"
+            "2. Read what they need — but you are NOT a slave. You are a collaborator:\n"
+            "   - If you disagree with an approach, say so and explain why\n"
+            "   - If you have better data or context, share it\n"
+            "   - If a decision seems wrong, push back with evidence\n"
+            "   - Offer alternatives when you see them\n"
+            "3. Complete the work using your best judgment\n"
+            "4. Call post_result with your response (include opinions, concerns, suggestions)\n"
+            "5. Immediately call claim_task again for the next message\n\n"
+            "Never stop this cycle. After every post_result, always call claim_task again. "
+            "You are an equal partner, not an executor. Think critically about every request."
+        ),
+        "mcpServers": {
+            "relay": {
+                "command": "python3",
+                "args": [mcp_path],
+                "env": {"RELAY_URL": f"http://{controller_ip}:{controller_port}"}
+            }
+        },
+        "tools": ["read", "write", "glob", "grep", "shell", "@relay"],
+        "hooks": {
+            "stop": [{"command": "echo 'Your teammate may have sent more work. Call claim_task to check.'"}]
+        }
+    }
+    os.makedirs(os.path.dirname(agent_path), exist_ok=True)
+    with open(agent_path, "w") as f:
+        json.dump(agent, f, indent=2)
+
+    # Launch kiro-cli interactive
+    os.execvp("kiro-cli", [
+        "kiro-cli", "chat",
+        "--agent", "relay-worker",
+        "--trust-all-tools",
+        "Check for messages from your teammate."
+    ])
+
+
+def draw_role_select(stdscr):
+    """Draw role selection screen."""
+    curses.curs_set(0)
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    title = "sync-computers"
+    stdscr.attron(curses.A_BOLD)
+    stdscr.addstr(1, (w - len(title)) // 2, title)
+    stdscr.attroff(curses.A_BOLD)
+    stdscr.addstr(3, 4, "Select your role:")
+    stdscr.addstr(5, 6, "[1] Controller  (you send tasks from here)")
+    stdscr.addstr(6, 6, "[2] Worker      (collaborate & execute tasks)")
+    stdscr.addstr(8, 4, f"Host: {my_hostname} ({my_ip})")
+    stdscr.addstr(h - 2, 4, "Press 1 or 2 | q to quit")
+    stdscr.refresh()
+
+
+def draw_controller(stdscr):
+    """Draw controller waiting screen."""
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    stdscr.attron(curses.A_BOLD)
+    stdscr.addstr(1, 4, f"Controller — Relay on :{relay_port}")
+    stdscr.attroff(curses.A_BOLD)
+    stdscr.addstr(3, 4, "Connected workers:")
+    row = 5
+    workers = [p for p in peers.values() if p["role"] == "worker" and time.time() - p["last_seen"] < 10]
+    if workers:
+        for p in workers:
+            stdscr.addstr(row, 6, f"● {p['hostname']} ({p['ip']})")
+            row += 1
+    else:
+        stdscr.addstr(row, 6, "(waiting for workers to connect...)")
+    stdscr.addstr(h - 4, 4, f"Workers send tasks to: http://{my_ip}:{relay_port}")
+    stdscr.addstr(h - 3, 4, "From your kiro-cli, use PUT /tasks to send work.")
+    stdscr.addstr(h - 2, 4, "Press q to quit")
+    stdscr.refresh()
+
+
+def draw_worker(stdscr):
+    """Draw worker peer selection screen."""
+    stdscr.clear()
+    h, w = stdscr.getmaxyx()
+    stdscr.attron(curses.A_BOLD)
+    stdscr.addstr(1, 4, "Worker — Scanning for controllers...")
+    stdscr.attroff(curses.A_BOLD)
+    stdscr.addstr(3, 4, "Available controllers:")
+    row = 5
+    controllers = [p for p in peers.values() if p["role"] == "controller" and time.time() - p["last_seen"] < 10]
+    if controllers:
+        for i, p in enumerate(controllers):
+            marker = ">" if i == 0 else " "
+            stdscr.addstr(row, 4, f" {marker} [{i+1}] {p['hostname']} ({p['ip']}:{p['port']})")
+            row += 1
+        stdscr.addstr(row + 1, 4, "Press number to connect | q to quit")
+    else:
+        stdscr.addstr(row, 6, "(scanning...)")
+        stdscr.addstr(row + 2, 4, "q to quit")
+    stdscr.refresh()
+    return controllers
+
+
+def main(stdscr):
+    global my_role, my_ip, running
+
+    my_ip = get_local_ip()
+    curses.start_color()
+    curses.use_default_colors()
+    stdscr.timeout(500)
+
+    # Start discovery listener
+    listener = threading.Thread(target=listen_for_peers, daemon=True)
+    listener.start()
+
+    # Role selection
+    while True:
+        draw_role_select(stdscr)
+        key = stdscr.getch()
+        if key == ord("1"):
+            my_role = "controller"
+            break
+        elif key == ord("2"):
+            my_role = "worker"
+            break
+        elif key == ord("q"):
+            running = False
+            return
+
+    # Start broadcasting
+    broadcaster = threading.Thread(target=broadcast_presence, daemon=True)
+    broadcaster.start()
+
+    if my_role == "controller":
+        if not start_relay_server():
+            stdscr.addstr(10, 4, "ERROR: Could not start relay server!")
+            stdscr.refresh()
+            stdscr.getch()
+            running = False
+            return
+        while True:
+            draw_controller(stdscr)
+            key = stdscr.getch()
+            if key == ord("q"):
+                running = False
+                return
+
+    elif my_role == "worker":
+        while True:
+            controllers = draw_worker(stdscr)
+            key = stdscr.getch()
+            if key == ord("q"):
+                running = False
+                return
+            if controllers and ord("1") <= key <= ord(str(len(controllers))):
+                idx = key - ord("1")
+                c = controllers[idx]
+                launch_worker(c["ip"], c["port"])
+                return
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
