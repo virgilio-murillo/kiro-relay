@@ -1,10 +1,34 @@
 #!/usr/bin/env python3
 """nsync-gui — TUI password manager with live search and pending approvals."""
 import curses
+import json
+import os
 import subprocess
 import sys
+import time
+
+CONFIG_FILE = os.path.expanduser("~/.config/nsync/config.json")
+_totp_code = None  # cached TOTP for the session
+
+
+def _needs_totp():
+    """Check if refresh token is likely expired (untrusted device, >1h)."""
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        if cfg.get("trusted"):
+            return False
+        ts = cfg.get("auth_timestamp", 0)
+        return (time.time() - ts) > 3600
+    except Exception:
+        return False
+
 
 def nsync(args, input_text=None):
+    global _totp_code
+    # If auth is needed and we have a cached TOTP, pass it via stdin
+    if input_text is None and _totp_code:
+        input_text = _totp_code
     try:
         p = subprocess.run(["nsync"] + args, capture_output=True, text=True, input=input_text, timeout=30)
         return p.stdout, p.stderr, p.returncode
@@ -70,10 +94,32 @@ class TUI:
         curses.init_pair(4, curses.COLOR_CYAN, -1)
         curses.init_pair(5, curses.COLOR_MAGENTA, -1)
 
+    def prompt_totp(self):
+        """Prompt for TOTP code within the TUI."""
+        global _totp_code
+        h, w = self.scr.getmaxyx()
+        self.scr.clear()
+        self.scr.addstr(h // 2 - 1, 2, "Session expired — TOTP required", curses.A_BOLD | curses.color_pair(2))
+        self.scr.addstr(h // 2, 2, "TOTP code: ")
+        self.scr.refresh()
+        curses.echo()
+        curses.curs_set(1)
+        code = self.scr.getstr(h // 2, 13, 10).decode().strip()
+        curses.noecho()
+        curses.curs_set(0)
+        if code:
+            _totp_code = code
+
     def load(self):
+        global _totp_code
+        if _totp_code is None and _needs_totp():
+            self.prompt_totp()
         self.msg = "Loading..."
         self.draw()
         self.entries = get_entries()
+        if not self.entries and _totp_code:
+            # TOTP may have been wrong or already consumed; clear for retry next time
+            _totp_code = None
         self.pending = get_pending()
         self.msg = f"{len(self.entries)} entries" + (f" | {len(self.pending)} pending!" if self.pending else "")
         self.do_filter()
