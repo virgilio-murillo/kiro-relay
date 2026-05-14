@@ -280,7 +280,11 @@ class TUI:
                         out, err, rc = nsync(["get", self.filtered[self.sel]])
                         self.view_val = out.strip() if rc == 0 else f"Error: {err}"
                         self.mode = "view"
-                        self.msg = ""
+                        if rc == 0:
+                            self.copy_to_clipboard(self.view_val.split("\n")[0])
+                            self.msg = "Copied to clipboard!"
+                        else:
+                            self.msg = ""
                 elif key == ord("A"):
                     if self.pending:
                         self.mode = "approve"
